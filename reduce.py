@@ -27,7 +27,9 @@ iraf.set(clobber='yes')
 
 iraf.set(stdimage='imtgmos')
 
-dooverscan = True
+dooverscan = False
+
+
 def sanitizeheader(hdr):
     # Remove the mandatory keywords from a header so it can be copied to a new
     # image.
@@ -46,6 +48,7 @@ def sanitizeheader(hdr):
 
     return hdr
 
+
 def tofits(filename, data, hdr=None, clobber=False):
     """simple pyfits wrapper to make saving fits files easier."""
     from pyfits import PrimaryHDU, HDUList
@@ -55,22 +58,29 @@ def tofits(filename, data, hdr=None, clobber=False):
     hdulist = HDUList([hdu])
     hdulist.writeto(filename, clobber=clobber, output_verify='ignore')
 
+
 def mad(d):
     return np.median(np.abs(np.median(d) - d))
+
 
 def magtoflux(wave, mag, zp):
     # convert from ab mag to flambda
     # 3e-19 is lambda^2 / c in units of angstrom / Hz
     return zp * 10 ** (-0.4 * mag) / 3.33564095e-19 / wave / wave
 
+
 def fluxtomag(flux):
     return -2.5 * np.log10(flux)
 
+
 def spectoascii(infilename, outfilename):
     hdu = pyfits.open(infilename)
-            
-    lam = fitshdr_to_wave(hdu['SCI'].header.copy())
-    flux = hdu['SCI'].data.copy()
+    try:
+        lam = fitshdr_to_wave(hdu['SCI'].header.copy())
+        flux = hdu['SCI'].data.copy()
+    except:
+        lam = fitshdr_to_wave(hdu[0].header.copy())
+        flux = hdu[0].data.copy()
     hdu.close()
     d = np.zeros((2, len(lam)))
     d[0] = lam
@@ -82,13 +92,41 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
 
     # read in the specfile and create a spectrum object
     obs_hdu = pyfits.open(specfile)
-    obs_flux = obs_hdu[2].data.copy()[0]
-    obs_hdr = obs_hdu[2].header.copy()
+    try:
+        obs_flux = obs_hdu[2].data.copy()[0]
+        obs_hdr = obs_hdu[2].header.copy()
+    except:
+        obs_flux = obs_hdu[0].data.copy()
+        obs_hdr = obs_hdu[0].header.copy()
     obs_hdu.close()
     obs_wave = fitshdr_to_wave(obs_hdr)
+
     # Mask out everything below 3350 where there is no signal
     obs_flux = obs_flux[obs_wave >= 3350.0]
     obs_wave = obs_wave[obs_wave >= 3350.0]
+
+    # Figure out where the chip gaps are
+    chip_edges = get_chipedges(obs_flux)
+
+
+    try:
+        chip_gaps = np.ones(obs_flux.size, dtype=np.bool)
+        for edge in chip_edges:
+            chip_gaps[edge[0]: edge[1]] = False
+    except:
+        chip_gaps = np.zeros(obs_flux.size, dtype=np.bool)
+
+    template_spectrum = signal.savgol_filter(obs_flux, 21, 3)
+    noise = np.abs(obs_flux - template_spectrum)
+    noise = ndimage.filters.gaussian_filter1d(noise, 100.0)
+
+    if chip_gaps.sum() != len(chip_gaps):
+        # Smooth the chip gaps
+        intpr = interpolate.splrep(obs_wave[np.logical_not(chip_gaps)],
+                                   obs_flux[np.logical_not(chip_gaps)],
+                                   w=1 / noise[np.logical_not(chip_gaps)], k=2,
+                                   s=20 * np.logical_not(chip_gaps).sum())
+        obs_flux[chip_gaps] = interpolate.splev(obs_wave[chip_gaps], intpr)
     # smooth the observed spectrum
     # read in the std file and convert from magnitudes to fnu
     # then convert it to fwave (ergs/s/cm2/A)
@@ -106,22 +144,173 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
     cal_flux = cal_std(obs_wave, obs_flux, std_wave, std_flux, ext_wave,
                              ext_mag, airmass, exptime)
 
-    
-    # Normailize the fit variables so the fit is well behaved
+    # fitted_flux = np.zeros(cal_flux.size)
+
+    # Split the chips just in case there are discrete steps between the chips
+    # For each chip
+    # for i in range(3):
+    #     inds = slice(chip_edges[i][0], chip_edges[i][1] + 1)
+    #     # Normalize the fit variables so the fit is well behaved
+    #     fitme_x = (obs_wave[inds] - obs_wave[inds].min()) / (obs_wave[inds].max() - obs_wave[inds].min())
+    #     fitme_y = cal_flux[inds] / np.median(cal_flux[inds])
+    #     coeffs = pfm.pffit(fitme_x, fitme_y, 0 , 5, robust=True,
+    #                    M=sm.robust.norms.AndrewWave())
+    #
+    #     fitted_flux[inds] = pfm.pfcalc(coeffs, fitme_x) * np.median(cal_flux[inds])
+
+
+    # Normalize the fit variables so the fit is well behaved
     fitme_x = (obs_wave - obs_wave.min()) / (obs_wave.max() - obs_wave.min())
     fitme_y = cal_flux / np.median(cal_flux)
-    coeffs = pfm.pffit(fitme_x, fitme_y, 15, 7, robust=True,
-                       M=sm.robust.norms.AndrewWave())
- 
-    cal_flux = pfm.pfcalc(coeffs, fitme_x) * np.median(cal_flux)
+    coeffs = pfm.pffit(fitme_x, fitme_y, 5 , 7, robust=True,
+                    M=sm.robust.norms.AndrewWave())
 
-    cal_mag = -1.0 * fluxtomag(cal_flux)
+    fitted_flux = pfm.pfcalc(coeffs, fitme_x) * np.median(cal_flux)
+    #
+    # # Interpolate over the chip gaps
+    # notchipgap = fitted_flux > 0
+    #
+    # intpr = interpolate.splrep(obs_wave[notchipgap], fitted_flux[notchipgap])
+    # fitted_flux[np.logical_not(notchipgap)] = interpolate.splev(obs_wave[np.logical_not(notchipgap)], intpr)
+
+    cal_mag = -1.0 * fluxtomag(fitted_flux)
     # write the spectra out
     cal_hdr = sanitizeheader(obs_hdr.copy())
     cal_hdr['OBJECT'] = 'Sensitivity function for all apertures'
     cal_hdr['CRVAL1'] = obs_wave.min()
+    cal_hdr['CRPIX1'] = 1
     tofits(outfile, cal_mag, hdr=cal_hdr, clobber=True)
 
+
+def hdr_pixel_range(x0, x1, y0, y1):
+    return '[{0:d}:{1:d},{2,d}:{3:d}]'.format(x0, x1, y0, y1)
+
+def cut_gs_image(filename, output_filename, pixel_range):
+    """
+
+    :param filename:
+    :param output_filename:
+    :param pixel_range: array-like, The range of pixels to keep, 0 indexed
+    :return:
+    """
+    hdu = pyfits.open(filename, unit16=True)
+    for i in range(1, 13):
+        detsec = hdr_pixel_range(512 * (i - 1) + 1, 512 * i,
+                                 pixel_range[0] + 1, pixel_range[1] + 1)
+        hdu[i].header['DETSEC'] = detsec
+
+        ccdsec = hdr_pixel_range(512 * (i % 3) + 1, 512 * (i % 3 + 1),
+                                 pixel_range[0] + 1, pixel_range[1] + 1)
+        hdu[i].header['CCDSEC'] = ccdsec
+
+        numpix = pixel_range[1] - pixel_range[0] + 1
+        hdu[i].header['DATASEC'] = hdr_pixel_range(1, 512, 1, numpix)
+        if i % 2 == 1: hdu[i].header['BIASSEC'] = hdr_pixel_range(517, 544, 1, numpix)
+        if i % 2 == 0: hdu[i].header['BIASSEC'] = hdr_pixel_range(1, 28, 1, numpix)
+
+        hdu[i].data = hdu[i].data[pixel_range[0]:pixel_range[1], :]
+
+    hdu.writeto(output_filename)
+
+
+def get_chipedges(data):
+        # Get the x coordinages of all of the chip gap pixels
+        # recall that pyfits opens images with coordinates y, x
+        if len(data.shape) > 1:
+            data = data[0]
+
+        try:
+            w = np.where(data == 0.0)[0]
+
+            # Note we also grow the chip gap by 8 pixels on each side
+            # Chip 1
+            chip_edges = []
+            left_chipedge = 10
+            morechips = True
+            while morechips:
+                try:
+                    right_chipedge = np.min(w[w > left_chipedge]) - 10
+                except:
+                    right_chipedge = data.size - 10
+                    morechips = False
+                chip_edges.append((left_chipedge, right_chipedge))
+
+                left_chipedge = np.max(w[w < right_chipedge + 200]) + 10
+        except:
+            chip_edges = []
+        return chip_edges
+
+
+def split1d(filename):
+
+    hdu = pyfits.open(filename)
+    chipedges = get_chipedges(hdu['SCI'].data[0])
+    lam = fitshdr_to_wave(hdu['SCI'].header)
+    # Copy each of the chips out seperately. Note that iraf is 1 indexed
+    for i in range(3):
+        # get the wavelengths that correspond to each chip
+        w1 = lam[chipedges[i][0]]
+        w2 = lam[chipedges[i][1]]
+        iraf.scopy(filename+ '[SCI]', output=filename[:-5] + 'c%i.fits' % (i + 1), w1=w1,
+                   w2=w2, rebin='no')
+        hdu.close()
+
+
+def mask_chipedges(filename):
+    """
+    Mask the edges of the chips with zeros to minimize artifacts.
+    :param filename: Name of file that contains the spectrum
+    :return:
+    """
+    hdu = pyfits.open(filename, mode='update')
+    chip_edges = get_chipedges(hdu['SCI'].data[0])
+    print(chip_edges)
+    # Set the data = 0 in the chip gaps
+    # Assume 3 chips for now.
+    for i in range(2):
+        hdu['SCI'].data[0, chip_edges[i][1]:chip_edges[i+1][0]] = 0.0
+
+    hdu.flush()
+    hdu.close()
+
+def renormalize_chips(filename):
+    # Read in the file
+    hdu = pyfits.open(filename, mode='update')
+    # Find the chip edges
+    chip_edges = get_chipedges(hdu['SCI'].data)
+
+    # Get the wavelengths of each pixel
+    lam = fitshdr_to_wave(hdu['SCI'].header)
+
+    # Assume 3 chips for now
+    # Fit the last 100 pixels on the first chip
+    last100 = slice(chip_edges[0][1] - 100, chip_edges[0][1] - 50)
+    fit_chip1 = np.polyfit(lam[last100], hdu['SCI'].data[0, last100], 1)
+
+    first100 = slice(chip_edges[1][0], chip_edges[1][0] + 100)
+    # Fit the first 100 pixels on the middle chip
+    fit_chip2 = np.polyfit(lam[first100], hdu['SCI'].data[0, first100], 1)
+    print(fit_chip1, fit_chip2)
+    # Normalize the first chip to the middle chip
+    scale = np.mean(fit_chip2 / fit_chip1)
+    hdu['SCI'].data[0, chip_edges[0][0]:chip_edges[0][1]] /= scale
+
+    # Fit the last 100 pixels on the middle chip
+    last100 = slice(chip_edges[1][1] - 100, chip_edges[1][1])
+    fit_chip2 = np.polyfit(lam[last100], hdu['SCI'].data[0, last100], 1)
+
+    # Fit the first 100 pixels on the last chip
+    first100 = slice(chip_edges[2][0]+50, chip_edges[2][0] + 100)
+    # Fit the first 100 pixels on the middle chip
+    fit_chip3 = np.polyfit(lam[first100], hdu['SCI'].data[0, first100], 1)
+
+    # Normalize the last chip to match the middle chip
+    scale = np.mean(fit_chip2 / fit_chip3)
+    hdu['SCI'].data[0, chip_edges[2][0]:chip_edges[2][1]] /= scale
+
+    # Write out the corrected image
+    hdu.flush()
+    hdu.close()
 
 def cal_std(obs_wave, obs_flux, std_wave, std_flux, ext_wave, ext_mag, airmass, exptime):
     """Given an observe spectra, calculate the calibration curve for the
@@ -131,14 +320,6 @@ def cal_std(obs_wave, obs_flux, std_wave, std_flux, ext_wave, ext_mag, airmass, 
        where F_obs is the observed flux from the source,  F_std  is the
        standard spectra, A is the airmass, E is the
        extinction in mags, T is the exposure time and dW is the bandpass
-    Parameters
-    -----------
-    obs_spectra--spectrum of the observed star (counts/A)
-    std_spectra--know spectrum of the standard star (ergs/s/cm2/A)
-    ext_spectra--spectrum of the extinction curve (in mags)
-    airmass--airmass of the observations
-    exptime--exposure time of the observations
-    function
     """
     
     # re-interpt the std_spectra over the same wavelength
@@ -181,9 +362,11 @@ def combine_spec_chi2(p, lam, specs, specerrs):
     # specs should be an array with shape (nspec, nlam)
     nspec = specs.shape[0]
     # scale each spectrum by the given value
+    # Assume 3 chips here
+    scales = np.repeat(p, 3)
 
-    scaledspec = (specs.transpose() * p).transpose()
-    scaled_spec_err = (specerrs.transpose() * p).transpose()
+    scaledspec = (specs.transpose() * scales).transpose()
+    scaled_spec_err = (specerrs.transpose() * scales).transpose()
 
     chi = 0.0
     # loop over each pair of spectra
@@ -208,38 +391,40 @@ def speccombine(fs, outfile):
     # get all of the science images
     specs = np.zeros((nfs, nsteps))
     specerrs = np.zeros((nfs, nsteps))
-
     for i, f in enumerate(fs):
         hdu = pyfits.open(f)
-        lam = fitshdr_to_wave(hdu['SCI'].header.copy())
-        # interpolate each spectrum onto a comman wavelength scale
+        lam = fitshdr_to_wave(hdu[0].header.copy())
 
-        specs[i] = np.interp(lamgrid, lam, hdu['SCI'].data[0],
-                          left=0.0, right=0.0)
+        # interpolate each spectrum onto a common wavelength scale
+
+        specs[i] = np.interp(lamgrid, lam, hdu[0].data,
+                             left=0.0, right=0.0)
         # Also calculate the errors. Right now we assume that the variances
-        # interpolate linearly. This is not stricly correct but it should be
+        # interpolate linearly. This is not strictly correct but it should be
         # close. Also we don't include terms in the variance for the
         # uncertainty in the wavelength solution.
         specerrs[i] = 0.1 * specs[i]
 
     # minimize the chi^2 given free parameters are multiplicative factors
     # We could use linear or quadratic, but for now assume constant
-    p0 = np.ones(nfs)
+    # Assume 3 chips for now
+    p0 = np.ones(nfs / 3)
 
     results = optimize.minimize(combine_spec_chi2, p0,
                                 args=(lamgrid, specs, specerrs),
                                 method='Nelder-Mead',
-                                options={'maxfev': 1e5, 'maxiter': 1e5})
+                                options={'maxfev': 1e5, 'maxiter': 1e5, 'ftol':1e-5})
 
     # write the best fit parameters into the headers of the files
     # Dump the list of spectra into a string that iraf can handle
-    iraf_filelist = str(fs).replace('[', '').replace(']', '').replace("'", '').replace(',', '[SCI],')
-    iraf_filelist += '[SCI]'
-    print(iraf_filelist)
+    iraf_filelist = str(fs).replace('[', '').replace(']', '').replace("'", '') #.replace(',', '[SCI],')
+    #iraf_filelist += '[SCI]'
+
     # write the best fit results into a file
     lines = []
-    for p in results['x']:
-        lines.append('%f\n' % p)
+
+    for p in np.repeat(results['x'], 3):
+        lines.append('%f\n' % (1.0 / p))
     f = open('scales.dat', 'w')
     f.writelines(lines)
     f.close()
@@ -248,16 +433,21 @@ def speccombine(fs, outfile):
         os.remove(outfile)
     iraf.unlearn(iraf.scombine)
     iraf.scombine(iraf_filelist, outfile, scale='@scales.dat',
-                  reject='avsigclip', lthreshold=1e-19, w1=3350)
+                  reject='avsigclip', lthreshold=1e-4, w1=3350)
 
 def fitshdr_to_wave(hdr):
     crval = float(hdr['CRVAL1'])
+    crpix = float(hdr['CRPIX1'])
+    # Convert crpix to be zero indexed
+    crpix -= 1
     if 'CDELT1' in hdr.keys():
         cdelt = float(hdr['CDELT1'])
     else:
         cdelt = float(hdr['CD1_1'])
-    nlam = float(hdr['NAXIS1'])
-    lam = np.arange(crval, crval + cdelt * nlam - 1e-4, cdelt)
+    npix = float(hdr['NAXIS1'])
+    lam = np.arange(crval - cdelt * crpix ,
+                    crval + cdelt * (npix - crpix) - 1e-4,
+                    cdelt)
     return lam
 
 def telluric_mask(waves):
@@ -278,12 +468,25 @@ def mktelluric(filename):
     hdr = hdu[0].header.copy()
     hdu.close()
     waves = fitshdr_to_wave(hdr)
-    
+
+    # Start by interpolating over the chip gaps
+    chip_edges = get_chipedges(spec)
+    chip_gaps = np.ones(spec.size, dtype=np.bool)
+    for edge in chip_edges:
+        chip_gaps[edge[0]: edge[1]] = False
+
     template_spectrum = signal.savgol_filter(spec, 21, 3)
     noise = np.abs(spec - template_spectrum)
     noise = ndimage.filters.gaussian_filter1d(noise, 100.0)
+
+    # Smooth the chip gaps
+    intpr = interpolate.splrep(waves[np.logical_not(chip_gaps)],
+                               spec[np.logical_not(chip_gaps)],
+                               w=1 / noise[np.logical_not(chip_gaps)], k=2,
+                               s=20 * np.logical_not(chip_gaps).sum())
+    spec[chip_gaps] = interpolate.splev(waves[chip_gaps], intpr)
+
     not_telluric = telluric_mask(waves)
-        
     # Smooth the spectrum so that the spline doesn't go as crazy
     # Use the Savitzky-Golay filter to presevere the edges of the
     # absorption features (both atomospheric and intrinsic to the star)
@@ -417,9 +620,11 @@ def init_northsouth(fs, topdir, rawpath):
     base_stddir = 'spec50cal/'
     extfile = iraf.osfn('gmisc$lib/onedstds/kpnoextinct.dat') 
     observatory = 'Gemini-North'
-    
+
     is_GS = pyfits.getval(fs[0], 'DETECTOR') == 'GMOS + Hamamatsu'
     if is_GS:
+        global dooverscan
+        dooverscan = True
         if not os.path.exists(topdir + '/raw_fixhdr'):
             os.mkdir(topdir + '/raw_fixhdr')
         rawpath = '%s/raw_fixhdr/' % topdir
@@ -428,6 +633,7 @@ def init_northsouth(fs, topdir, rawpath):
         observatory = 'Gemini-South'
         extfile = iraf.osfn('gmisc$lib/onedstds/ctioextinct.dat') 
     return extfile, observatory, base_stddir, rawpath
+
 
 def getobstypes(fs):
     # get the type of observation for each file
@@ -441,7 +647,12 @@ def getobstypes(fs):
     obsclasses = np.array(obsclasses)
     return obstypes, obsclasses
 
+
 def makebias(fs, obstypes, rawpath):
+    for f in fs:
+        if f[-10:] == '_bias.fits':
+            shutil.copy(f, 'bias.fits')
+
     if not os.path.exists('bias.fits'):
         # Make the master bias
         biastxtfile = open('bias.txt', 'w')
@@ -451,6 +662,7 @@ def makebias(fs, obstypes, rawpath):
         biastxtfile.close()
         iraf.gbias('@%s/bias.txt' % os.getcwd(), 'bias', rawpath=rawpath, fl_over=dooverscan)
 
+
 def getobjname(fs, obstypes):
     objname = pyfits.getval(fs[obstypes == 'OBJECT'][0], 'OBJECT', ext=0).lower()
     
@@ -458,6 +670,7 @@ def getobjname(fs, obstypes):
     objname = objname.replace('+', '')
     objname = ''.join(objname.split())
     return objname
+
 
 def maketxtfiles(fs, obstypes, obsclasses, objname):
     # go through each of the files (Ignore bias and aquisition files)
@@ -504,6 +717,7 @@ def maketxtfiles(fs, obstypes, obsclasses, objname):
         txtfile.write(fname + '\n')
         txtfile.close()
 
+
 def gettxtfiles(fs, objname):
        
     flatfiles = np.array(glob('*.flat.txt'))
@@ -525,14 +739,17 @@ def gettxtfiles(fs, objname):
 
     return flatfiles, arcfiles, scifiles
 
+
 def makemasterflat(flatfiles, rawpath):
     # normalize the flat fields
     for f in flatfiles:
         iraf.unlearn(iraf.gsflat)
         # Use IRAF to get put the data in the right format and subtract the
         # bias
-        iraf.gsflat('@' + f, f[:-4], order=51, rawpath=rawpath, fl_fixpix='yes',
-                    bias="bias", fl_inter='no', niterate=3, low_reject=5.0, high_reject=5.0, fl_over=dooverscan, function='legendre')
+        iraf.gsflat('@' + f, f[:-4], order=5, rawpath=rawpath, fl_fixpix='no',
+                    bias="bias", fl_inter='no', niterate=5, low_reject=3.0,
+                    high_reject=2.5, fl_over=dooverscan, function='legendre',
+                    fl_detec='yes')
 
 
 def wavesol(arcfiles, rawpath):
@@ -544,7 +761,7 @@ def wavesol(arcfiles, rawpath):
         
         # determine wavelength calibration -- 1d and 2d
         iraf.unlearn(iraf.gswavelength)
-        iraf.gswavelength(f[:-4], fl_inter='yes', low_reject=2.0,
+        iraf.gswavelength(f[:-4], fl_inter='yes', fwidth=15.0, low_reject=2.0,
                           high_reject=2.0, step=10, nsum=10, gsigma=3.0,
                           cradius=25.0, match=-12, order=7, fitcxord=7,
                           fitcyord=7)
@@ -567,7 +784,7 @@ def scireduce(scifiles, rawpath):
         # gsreduce subtracts bias, mosaics detectors, flat fields
         iraf.unlearn(iraf.gsreduce)
         iraf.gsreduce('@' + f, outimages=f[:-4], rawpath=rawpath, bias="bias",
-                      flat=setupname + '.flat', fl_over=dooverscan)
+                      flat=setupname + '.flat', fl_over=dooverscan, fl_fixpix='no')
 
         # Transform the data based on the arc  wavelength solution 
         iraf.unlearn(iraf.gstransform)
@@ -598,9 +815,11 @@ def crreject(scifiles):
         # robust against outliers
         dsig = (dsort[0.84 * nd] - dsort[0.16 * nd]) / 2.0
         pssl = (dsig * dsig - readnoise * readnoise)
-        
-        crmask, _cleanarr = lacosmicx.lacosmicx(d, sigclip=4.0, objlim=1.0, sigfrac=0.05,
-                                     gain=1.0, readnoise=readnoise, pssl=pssl)
+
+        mask = d == 0.0
+        crmask, _cleanarr = lacosmicx.lacosmicx(d, inmask=mask, sigclip=4.0,
+                                                objlim=1.0, sigfrac=0.05, gain=1.0,
+                                                readnoise=readnoise, pssl=pssl)
         
         tofits(f[:-4] + '.lamask.fits', np.array(crmask, dtype=np.uint8), hdr=hdu['SCI'].header.copy())
 
@@ -734,39 +953,42 @@ if __name__ == "__main__":
     
     # Get the wavelength solution
     wavesol(arcfiles, rawpath)
-    
+
     # Flat field and rectify the scienc images
     scireduce(scifiles, rawpath)
-    
+
     # Run sky subtraction
     skysub(scifiles, rawpath)
-    
+
     # Run LA Cosmic
     crreject(scifiles)
-    
+
     # Fix the cosmic ray pixels
     fixpix(scifiles)
-    
+
     # Extract the 1D spectrum
     extract(scifiles)
-    
+
     # If standard star, make the sensitivity function
     makesensfunc(scifiles, objname, base_stddir, extfile)
     
     # Flux calibrate the spectrum
     calibrate(scifiles, extfile, observatory)
-    
+
+    extractedfiles = glob('cet*.fits')
+
     # Write the spectra to ascii
     for f in scifiles:
         if os.path.exists('cet' + f[:-4] + '.fits'):
-            # Make the ascii file            
+            split1d('cet' + f[:-4] + '.fits')
+            # Make the ascii file
             spectoascii('cet' + f[:-4] + '.fits',f[:-4] + '.dat')
             
     # Get all of the extracted files
-    extractedfiles = glob('cet*.fits')
+    splitfiles = glob('cet*c[1-9].fits')
     
     # Combine the spectra
-    speccombine(extractedfiles, objname + '_com.fits')
+    speccombine(splitfiles, objname + '_com.fits')
     
     # write out the ascii file
     spectoascii(objname + '_com.fits', objname + '_com.dat')
