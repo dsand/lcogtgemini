@@ -13,8 +13,8 @@ from pyraf import iraf
 from scipy import interpolate, ndimage, signal, optimize
 import pf_model as pfm
 import statsmodels as sm
+from astropy.modeling import models, fitting
 
-########## in iraf:
 iraf.cd(os.getcwd())
 iraf.gemini()
 iraf.gmos()
@@ -28,7 +28,72 @@ iraf.set(clobber='yes')
 iraf.set(stdimage='imtgmos')
 
 dooverscan = False
+is_GS = False
 
+def normalize_fitting_coordinate(x):
+    xrange = x.max() - x.min()
+    return (x - x.min()) / xrange
+
+
+# Iterative reweighting linear least squares
+def irls(x, data, errors, model, tol=1e-6, M=sm.robust.norms.AndrewWave(), maxiter=10):
+    fitter = fitting.LinearLSQFitter()
+
+    if x is None:
+        # Make x and y arrays out of the indicies
+        x = np.indices(data.shape, dtype=np.float)
+
+        if len(data.shape) == 2:
+            y, x = x
+        else:
+            x = x[0]
+
+        #Normalize to make fitting easier
+        x = normalize_fitting_coordinate(x)
+        if len(data.shape) == 2:
+            y = normalize_fitting_coordinate(y)
+
+    scatter = errors
+    # Do an initial fit of the model
+    # Use 1 / sigma^2 as weights
+    weights = (errors ** -2.0).flatten()
+
+    if len(data.shape) == 2:
+        fitted_model = fitter(model, x, y, data, weights=weights)
+    else:
+        fitted_model = fitter(model, x, data, weights=weights)
+
+    notconverged=True
+    last_chi = np.inf
+    iter = 0
+    # Until converged
+    while notconverged:
+        # Update the weights
+        if len(data.shape) == 2:
+            residuals = data - fitted_model(x, y)
+        else:
+            residuals = data - fitted_model(x)
+        # Save the chi^2 to check for convergence
+        chi = ((residuals / scatter) ** 2.0).sum()
+
+        # update the scaling (the MAD of the residuals)
+        scatter = mad(residuals)  * 1.4826 # To convert to standard deviation
+        weights = M.weights(residuals / scatter).flatten()
+
+        # refit
+        if len(data.shape) == 2:
+            fitted_model = fitter(model, x, y, data, weights=weights)
+        else:
+            fitted_model = fitter(model, x, data, weights=weights)
+        # converged when the change in the chi^2 (or l2 norm or whatever) is
+        # less than the tolerance. Hopefully this should converge quickly.
+        if iter >= maxiter or np.abs(chi - last_chi) < tol:
+            notconverged = False
+        else:
+            last_chi = chi
+            iter += 1
+
+    return fitted_model
 
 def sanitizeheader(hdr):
     # Remove the mandatory keywords from a header so it can be copied to a new
@@ -144,21 +209,6 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
     cal_flux = cal_std(obs_wave, obs_flux, std_wave, std_flux, ext_wave,
                              ext_mag, airmass, exptime)
 
-    # fitted_flux = np.zeros(cal_flux.size)
-
-    # Split the chips just in case there are discrete steps between the chips
-    # For each chip
-    # for i in range(3):
-    #     inds = slice(chip_edges[i][0], chip_edges[i][1] + 1)
-    #     # Normalize the fit variables so the fit is well behaved
-    #     fitme_x = (obs_wave[inds] - obs_wave[inds].min()) / (obs_wave[inds].max() - obs_wave[inds].min())
-    #     fitme_y = cal_flux[inds] / np.median(cal_flux[inds])
-    #     coeffs = pfm.pffit(fitme_x, fitme_y, 0 , 5, robust=True,
-    #                    M=sm.robust.norms.AndrewWave())
-    #
-    #     fitted_flux[inds] = pfm.pfcalc(coeffs, fitme_x) * np.median(cal_flux[inds])
-
-
     # Normalize the fit variables so the fit is well behaved
     fitme_x = (obs_wave - obs_wave.min()) / (obs_wave.max() - obs_wave.min())
     fitme_y = cal_flux / np.median(cal_flux)
@@ -166,12 +216,6 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
                     M=sm.robust.norms.AndrewWave())
 
     fitted_flux = pfm.pfcalc(coeffs, fitme_x) * np.median(cal_flux)
-    #
-    # # Interpolate over the chip gaps
-    # notchipgap = fitted_flux > 0
-    #
-    # intpr = interpolate.splrep(obs_wave[notchipgap], fitted_flux[notchipgap])
-    # fitted_flux[np.logical_not(notchipgap)] = interpolate.splev(obs_wave[np.logical_not(notchipgap)], intpr)
 
     cal_mag = -1.0 * fluxtomag(fitted_flux)
     # write the spectra out
@@ -183,35 +227,49 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
 
 
 def hdr_pixel_range(x0, x1, y0, y1):
-    return '[{0:d}:{1:d},{2,d}:{3:d}]'.format(x0, x1, y0, y1)
+    return '[{0:d}:{1:d},{2:d}:{3:d}]'.format(x0, x1, y0, y1)
 
 def cut_gs_image(filename, output_filename, pixel_range):
     """
 
     :param filename:
     :param output_filename:
-    :param pixel_range: array-like, The range of pixels to keep, 0 indexed
+    :param pixel_range: array-like, The range of pixels to keep, python indexed,
+                        given in binned pixels
     :return:
     """
     hdu = pyfits.open(filename, unit16=True)
     for i in range(1, 13):
+        ccdsum = hdu[i].header['CCDSUM']
+        ccdsum = np.array(ccdsum.split(), dtype=np.int)
+
+        y_ccdsec = [(pixel_range[0]  * ccdsum[1]) + 1,
+                    (pixel_range[1]) * ccdsum[1]]
+
         detsec = hdr_pixel_range(512 * (i - 1) + 1, 512 * i,
-                                 pixel_range[0] + 1, pixel_range[1] + 1)
+                                 y_ccdsec[0], y_ccdsec[1])
         hdu[i].header['DETSEC'] = detsec
 
-        ccdsec = hdr_pixel_range(512 * (i % 3) + 1, 512 * (i % 3 + 1),
-                                 pixel_range[0] + 1, pixel_range[1] + 1)
+        ccdsec = hdr_pixel_range(512 * ((i - 1) % 4) + 1, 512 * ((i - 1) % 4 + 1),
+                                 y_ccdsec[0], y_ccdsec[1])
+
         hdu[i].header['CCDSEC'] = ccdsec
 
-        numpix = pixel_range[1] - pixel_range[0] + 1
-        hdu[i].header['DATASEC'] = hdr_pixel_range(1, 512, 1, numpix)
-        if i % 2 == 1: hdu[i].header['BIASSEC'] = hdr_pixel_range(517, 544, 1, numpix)
-        if i % 2 == 0: hdu[i].header['BIASSEC'] = hdr_pixel_range(1, 28, 1, numpix)
+        numpix = pixel_range[1] - pixel_range[0]
+
+        xsize = 512 / ccdsum[0]
+        # Add a 4 pixel buffer to the overscan region because of bleed over
+        if i % 2 == 1:
+            hdu[i].header['BIASSEC'] = hdr_pixel_range(xsize + 5, xsize + 32, 1, numpix)
+            hdu[i].header['DATASEC'] = hdr_pixel_range(1, xsize, 1, numpix)
+        if i % 2 == 0:
+            hdu[i].header['BIASSEC'] = hdr_pixel_range(1, 28, 1, numpix)
+            hdu[i].header['DATASEC'] = hdr_pixel_range(33, xsize + 32, 1, numpix)
 
         hdu[i].data = hdu[i].data[pixel_range[0]:pixel_range[1], :]
 
     hdu.writeto(output_filename)
-
+    hdu.close()
 
 def get_chipedges(data):
         # Get the x coordinages of all of the chip gap pixels
@@ -235,7 +293,7 @@ def get_chipedges(data):
                     morechips = False
                 chip_edges.append((left_chipedge, right_chipedge))
 
-                left_chipedge = np.max(w[w < right_chipedge + 200]) + 10
+                left_chipedge = np.max(w[w < right_chipedge + 100]) + 10
         except:
             chip_edges = []
         return chip_edges
@@ -273,44 +331,6 @@ def mask_chipedges(filename):
     hdu.flush()
     hdu.close()
 
-def renormalize_chips(filename):
-    # Read in the file
-    hdu = pyfits.open(filename, mode='update')
-    # Find the chip edges
-    chip_edges = get_chipedges(hdu['SCI'].data)
-
-    # Get the wavelengths of each pixel
-    lam = fitshdr_to_wave(hdu['SCI'].header)
-
-    # Assume 3 chips for now
-    # Fit the last 100 pixels on the first chip
-    last100 = slice(chip_edges[0][1] - 100, chip_edges[0][1] - 50)
-    fit_chip1 = np.polyfit(lam[last100], hdu['SCI'].data[0, last100], 1)
-
-    first100 = slice(chip_edges[1][0], chip_edges[1][0] + 100)
-    # Fit the first 100 pixels on the middle chip
-    fit_chip2 = np.polyfit(lam[first100], hdu['SCI'].data[0, first100], 1)
-    print(fit_chip1, fit_chip2)
-    # Normalize the first chip to the middle chip
-    scale = np.mean(fit_chip2 / fit_chip1)
-    hdu['SCI'].data[0, chip_edges[0][0]:chip_edges[0][1]] /= scale
-
-    # Fit the last 100 pixels on the middle chip
-    last100 = slice(chip_edges[1][1] - 100, chip_edges[1][1])
-    fit_chip2 = np.polyfit(lam[last100], hdu['SCI'].data[0, last100], 1)
-
-    # Fit the first 100 pixels on the last chip
-    first100 = slice(chip_edges[2][0]+50, chip_edges[2][0] + 100)
-    # Fit the first 100 pixels on the middle chip
-    fit_chip3 = np.polyfit(lam[first100], hdu['SCI'].data[0, first100], 1)
-
-    # Normalize the last chip to match the middle chip
-    scale = np.mean(fit_chip2 / fit_chip3)
-    hdu['SCI'].data[0, chip_edges[2][0]:chip_edges[2][1]] /= scale
-
-    # Write out the corrected image
-    hdu.flush()
-    hdu.close()
 
 def cal_std(obs_wave, obs_flux, std_wave, std_flux, ext_wave, ext_mag, airmass, exptime):
     """Given an observe spectra, calculate the calibration curve for the
@@ -571,7 +591,7 @@ def xcorfun(p, warr, farr, telwarr, telfarr):
     # spectrum
     # Make the artifical spectrum to cross correlate
     asfarr = np.interp(warr, p[0] * telwarr + p[1], telfarr, left=1.0, right=1.0)
-    return abs(1.0 / ncor(farr, asfarr))
+    return np.abs(1.0 / ncor(farr, asfarr))
 
 def fitxcor(warr, farr, telwarr, telfarr):
     """Maximize the normalized cross correlation coefficient for the telluric
@@ -621,6 +641,7 @@ def init_northsouth(fs, topdir, rawpath):
     extfile = iraf.osfn('gmisc$lib/onedstds/kpnoextinct.dat') 
     observatory = 'Gemini-North'
 
+    global is_GS
     is_GS = pyfits.getval(fs[0], 'DETECTOR') == 'GMOS + Hamamatsu'
     if is_GS:
         global dooverscan
@@ -746,19 +767,83 @@ def makemasterflat(flatfiles, rawpath):
         iraf.unlearn(iraf.gsflat)
         # Use IRAF to get put the data in the right format and subtract the
         # bias
-        iraf.gsflat('@' + f, f[:-4], order=5, rawpath=rawpath, fl_fixpix='no',
+        iraf.gsflat('@' + f, f[:-4], order=5, rawpath=rawpath, fl_keep='yes',
+                    combflat=f[:-4]+'.com',fl_fixpix='no',
                     bias="bias", fl_inter='no', niterate=5, low_reject=3.0,
                     high_reject=2.5, fl_over=dooverscan, function='legendre',
                     fl_detec='yes')
 
+        # Divide the combined flat by the pixel to pixel flat
+
+        # Mosaic the combined flat
+        iraf.unlearn(iraf.gmosaic)
+        iraf.gmosaic(f[:-4] + '.com.fits', outimages=f[:-4] + '.mos.fits', fl_clean=False)
+        # Renormalize the chips to remove the discrete jump in the
+        # sensitivity due to differences in the QE for different chips
+        combined_flat_hdu = pyfits.open(f[:-4] + '.mos.fits')
+
+        data = np.median(combined_flat_hdu['SCI'].data, axis=0)
+        chip_edges = get_chipedges(data)
+        fitme_x = np.arange(len(data), dtype=np.float)
+        fitme_x /= fitme_x.max()
+        fitme_y = data / np.median(data)
+
+        leftchip = slice(chip_edges[0][1] - 200, chip_edges[0][1])
+        leftchip_fit = pfm.pffit(fitme_x[leftchip], fitme_y[leftchip], 0 , 1,
+                                 robust=True, M=sm.robust.norms.AndrewWave())
+
+        # Normalize to the middle chip for now
+        middlechip = slice(chip_edges[1][0], chip_edges[1][0] + 150)
+
+        middlechip_ratio = fitme_y[middlechip] / pfm.pfcalc(leftchip_fit, fitme_x[middlechip])
+        left_middlechip_fit = pfm.pffit(fitme_x[middlechip], middlechip_ratio, 0 , 0, robust=True,
+                                   M=sm.robust.norms.AndrewWave())
+
+
+        # Normalize to the middle chip for now
+        rightchip = slice(chip_edges[2][0], chip_edges[2][0] + 200)
+        rightchip_fit = pfm.pffit(fitme_x[rightchip], fitme_y[rightchip], 0 , 1, robust=True,
+                                  M=sm.robust.norms.AndrewWave())
+
+        # Then normalize the right chip to the middle chip
+        middlechip = slice(chip_edges[1][1] - 200, chip_edges[1][1])
+        middlechip_ratio = fitme_y[middlechip] / pfm.pfcalc(rightchip_fit, fitme_x[middlechip])
+        right_middlechip_fit = pfm.pffit(fitme_x[middlechip], middlechip_ratio, 0 , 0,
+                                   robust=True, M=sm.robust.norms.AndrewWave())
+
+        combined_flat_hdu.close()
+
+        # Save the rescaling
+        chipnorms = open(f[:-9]+'.chipnorms.dat', 'w')
+        chipnorms.writelines('%f %f' % (left_middlechip_fit[0][0], right_middlechip_fit[0][0]))
+        chipnorms.close()
 
 def wavesol(arcfiles, rawpath):
     for f in arcfiles:
         iraf.unlearn(iraf.gsreduce)
-        iraf.gsreduce('@' + f, outimages=f[:-4], rawpath=rawpath,
-                      fl_flat=False, bias="bias", fl_fixpix=False,
-                      fl_over=dooverscan)
-        
+        iraf.gsreduce('@' + f, outimages=f[:-4] + '.mef', rawpath=rawpath,
+                      fl_flat=True, bias="bias", flat=f[:-4].replace('arc', 'flat'),
+                      fl_fixpix=False, fl_over=dooverscan, fl_cut=False, fl_gmosaic=False,
+                      fl_gsappwave=False, fl_oversize=False)
+
+        # Read in the chip normalization
+        chip_norms = np.genfromtxt(f[:-8]+'.chipnorms.dat')
+        hdu = pyfits.open(f[:-4] + '.mef.fits', mode='update')
+
+        for i in range(1,5):
+            hdu[i].data *= chip_norms[0]
+        for i in range(9,13):
+            hdu[i].data *= chip_norms[1]
+
+        hdu.flush()
+        hdu.close()
+
+        iraf.unlearn(iraf.gmosaic)
+        iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4] +'.fits', fl_clean=False)
+
+        iraf.unlearn(iraf.gsappwave)
+        iraf.gsappwave(f[:-4] + '.fits')
+
         # determine wavelength calibration -- 1d and 2d
         iraf.unlearn(iraf.gswavelength)
         iraf.gswavelength(f[:-4], fl_inter='yes', fwidth=15.0, low_reject=2.0,
@@ -783,8 +868,27 @@ def scireduce(scifiles, rawpath):
         setupname = getsetupname(f)
         # gsreduce subtracts bias, mosaics detectors, flat fields
         iraf.unlearn(iraf.gsreduce)
-        iraf.gsreduce('@' + f, outimages=f[:-4], rawpath=rawpath, bias="bias",
-                      flat=setupname + '.flat', fl_over=dooverscan, fl_fixpix='no')
+        iraf.gsreduce('@' + f, outimages=f[:-4]+'.mef', rawpath=rawpath, bias="bias",
+                      flat=setupname + '.flat', fl_over=dooverscan, fl_fixpix='no',
+                      fl_gmosaic=False, fl_cut=False, fl_gsappwave=False, fl_oversize=False, fl_flat=False)
+
+        # Read in the chip normalization
+        # chip_norms = np.genfromtxt(setupname+'.chipnorms.dat')
+        # hdu = pyfits.open(f[:-4] + '.mef.fits', mode='update')
+        #
+        # for i in range(1,5):
+        #     hdu[i].data *= chip_norms[0]
+        # for i in range(9,13):
+        #     hdu[i].data *= chip_norms[1]
+        #
+        # hdu.flush()
+        # hdu.close()
+
+        iraf.unlearn(iraf.gmosaic)
+        iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4] +'.fits', fl_clean=False)
+
+        iraf.unlearn(iraf.gsappwave)
+        iraf.gsappwave(f[:-4] + '.fits')
 
         # Transform the data based on the arc  wavelength solution 
         iraf.unlearn(iraf.gstransform)
@@ -918,7 +1022,7 @@ if __name__ == "__main__":
     # before running this script
     
     # launch the image viewer
-    os.system('ds9 &')
+    # os.system('ds9 &')
     
     topdir = os.getcwd()
     # Get the raw directory
