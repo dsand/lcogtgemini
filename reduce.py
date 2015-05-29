@@ -767,22 +767,52 @@ def makemasterflat(flatfiles, rawpath):
         iraf.unlearn(iraf.gsflat)
         # Use IRAF to get put the data in the right format and subtract the
         # bias
-        iraf.gsflat('@' + f, f[:-4], order=5, rawpath=rawpath, fl_keep='yes',
-                    combflat=f[:-4]+'.com',fl_fixpix='no',
-                    bias="bias", fl_inter='no', niterate=5, low_reject=3.0,
-                    high_reject=2.5, fl_over=dooverscan, function='legendre',
-                    fl_detec='yes')
+        # This will currently break if multiple flats are used for a single setting
+        iraf.unlearn(iraf.gsreduce)
+        iraf.gsreduce('@' + f, outimages = f[:-4]+'.mef.fits',rawpath=rawpath,
+                      bias="bias", fl_over=dooverscan, fl_flat=False, fl_gmosaic=False,
+                      fl_fixpix=False, fl_gsappwave=False, fl_cut=False, fl_title=False,
+                      fl_oversize=False)
 
-        # Divide the combined flat by the pixel to pixel flat
+        # Divide the flat by the median over the spatial direction
+        hdunorm = pyfits.open(f[:-4] + '.mef.fits')
+
+        for i in range(1, 13):
+            meddata = np.median(hdunorm[i].data, axis=0)
+
+            # Fit out the ramp up on the edge of the chip
+            x = np.arange(len(meddata), dtype=np.float)
+            x /= x.max()
+            if i in [1, 5, 9]:
+                fit = pfm.pffit(x[50:100], meddata[50:100], 0, 1,
+                                robust=True, M=sm.robust.norms.AndrewWave())
+                meddata[:50] = pfm.pfcalc(fit, x[:50])
+            elif i in [4, 8, 12]:
+                fit = pfm.pffit(x[-100:-50], meddata[-100:-50], 0, 1,
+                                robust=True, M=sm.robust.norms.AndrewWave())
+                meddata[-50:] = pfm.pfcalc(fit, x[-50:])
+
+            hdunorm[i].data /= meddata
+
+
+        # Now we want to fit the jumps between chips
+        hdu = pyfits.open(f[:-4] + '.mef.fits')
+        # Divide out the pixel to pixel sensitivity
+        for i in range(1, 13):
+            hdu[i].data /= hdunorm[i].data
+        hdu.writeto(f[:-4]+'.flt.fits', clobber=True)
+        hdu.close()
 
         # Mosaic the combined flat
         iraf.unlearn(iraf.gmosaic)
-        iraf.gmosaic(f[:-4] + '.com.fits', outimages=f[:-4] + '.mos.fits', fl_clean=False)
+        iraf.gmosaic(f[:-4] + '.flt.fits', outimages=f[:-4] + '.mos.fits', fl_clean=False)
+
         # Renormalize the chips to remove the discrete jump in the
         # sensitivity due to differences in the QE for different chips
-        combined_flat_hdu = pyfits.open(f[:-4] + '.mos.fits')
 
-        data = np.median(combined_flat_hdu['SCI'].data, axis=0)
+        flat_hdu = pyfits.open(f[:-4] + '.mos.fits')
+
+        data = np.median(flat_hdu['SCI'].data, axis=0)
         chip_edges = get_chipedges(data)
         fitme_x = np.arange(len(data), dtype=np.float)
         fitme_x /= fitme_x.max()
@@ -793,10 +823,9 @@ def makemasterflat(flatfiles, rawpath):
                                  robust=True, M=sm.robust.norms.AndrewWave())
 
         # Normalize to the middle chip for now
-        middlechip = slice(chip_edges[1][0], chip_edges[1][0] + 150)
+        left_middlechip = slice(chip_edges[1][0], chip_edges[1][0] + 150)
 
-        middlechip_ratio = fitme_y[middlechip] / pfm.pfcalc(leftchip_fit, fitme_x[middlechip])
-        left_middlechip_fit = pfm.pffit(fitme_x[middlechip], middlechip_ratio, 0 , 0, robust=True,
+        left_middlechip_fit = pfm.pffit(fitme_x[left_middlechip], fitme_y[left_middlechip], 0 , 1, robust=True,
                                    M=sm.robust.norms.AndrewWave())
 
 
@@ -806,43 +835,84 @@ def makemasterflat(flatfiles, rawpath):
                                   M=sm.robust.norms.AndrewWave())
 
         # Then normalize the right chip to the middle chip
-        middlechip = slice(chip_edges[1][1] - 200, chip_edges[1][1])
-        middlechip_ratio = fitme_y[middlechip] / pfm.pfcalc(rightchip_fit, fitme_x[middlechip])
-        right_middlechip_fit = pfm.pffit(fitme_x[middlechip], middlechip_ratio, 0 , 0,
+        right_middlechip = slice(chip_edges[1][1] - 200, chip_edges[1][1])
+        right_middlechip_fit = pfm.pffit(fitme_x[right_middlechip], fitme_y[right_middlechip], 0 , 1,
                                    robust=True, M=sm.robust.norms.AndrewWave())
 
-        combined_flat_hdu.close()
+        # Save the normalized flat as a MEF file
+        hdunorm.writeto(f[:-4]+'.norm.mef.fits', clobber=True)
 
-        # Save the rescaling
-        chipnorms = open(f[:-9]+'.chipnorms.dat', 'w')
-        chipnorms.writelines('%f %f' % (left_middlechip_fit[0][0], right_middlechip_fit[0][0]))
-        chipnorms.close()
+        hdunorm.close()
+        # mosaic the normalized file
+        iraf.unlearn(iraf.gmosaic)
+        iraf.gmosaic(f[:-4] + '.norm.mef.fits', outimages=f[:-4] + '.fits', fl_clean=False)
+        #print(leftchip_fit, left_middlechip_fit)
+        #print(rightchip_fit, right_middlechip_fit)
+        #from matplotlib import pyplot
+        #pyplot.plot(fitme_x, fitme_y)
+        #pyplot.plot(fitme_x, pfm.pfcalc(leftchip_fit, fitme_x))
+        #pyplot.plot(fitme_x, pfm.pfcalc(left_middlechip_fit, fitme_x))
+        #pyplot.plot(fitme_x, pfm.pfcalc(rightchip_fit, fitme_x))
+        #pyplot.plot(fitme_x, pfm.pfcalc(right_middlechip_fit, fitme_x))
+        #pyplot.plot(fitme_x, pfm.pfcalc(rightchip_fit, fitme_x) / pfm.pfcalc(right_middlechip_fit, fitme_x))
+        #pyplot.show()
+        hdunorm = pyfits.open(f[:-4]+'.fits', mode='update')
+        # Renormalize the left and right chips from the fits above.
+        # Get the value of the fits at the left edge of the middle chip
+        leftedge = chip_edges[1][0]
+        #if pfm.pfcalc(leftchip_fit, fitme_x[leftedge]) <  pfm.pfcalc(left_middlechip_fit, fitme_x[leftedge]):
+        #     # Raise the left chip
+        #     leftx = fitme_x[:chip_edges[0][1]]
+        #     #leftcorrection = pfm.pfcalc(leftchip_fit, leftx) / pfm.pfcalc(left_middlechip_fit, leftx)
+        #     leftcorrection = pfm.pfcalc(leftchip_fit, fitme_x[leftedge]) / pfm.pfcalc(left_middlechip_fit, fitme_x[leftedge])
+        #     hdunorm['SCI'].data[:,:chip_edges[0][1]] *= leftcorrection
+        # else:
+        #     middlex = fitme_x[chip_edges[1][0]:chip_edges[1][1]+1]
+        #     #middlecorrection = pfm.pfcalc(left_middlechip_fit, middlex) / pfm.pfcalc(leftchip_fit, middlex)
+        #     middlecorrection = pfm.pfcalc(left_middlechip_fit, fitme_x[leftedge]) / pfm.pfcalc(leftchip_fit, fitme_x[leftedge])
+        #
+        #     hdunorm['SCI'].data[:,chip_edges[1][0]:chip_edges[1][1]+1] /= middlecorrection
+
+        leftcorrection = pfm.pfcalc(leftchip_fit, fitme_x[leftedge]) / pfm.pfcalc(left_middlechip_fit, fitme_x[leftedge])
+        hdunorm['SCI'].data[:,:chip_edges[0][1]] *= leftcorrection
+        rightedge = chip_edges[1][1]
+        # if pfm.pfcalc(rightchip_fit, fitme_x[rightedge]) <  pfm.pfcalc(right_middlechip_fit, fitme_x[rightedge]):
+        #     rightx = fitme_x[chip_edges[2][0]:]
+        #     #rightcorrection = pfm.pfcalc(rightchip_fit, rightx) / pfm.pfcalc(right_middlechip_fit, rightx)
+        #     rightcorrection = pfm.pfcalc(rightchip_fit, fitme_x[rightedge]) / pfm.pfcalc(right_middlechip_fit, fitme_x[rightedge])
+        #     hdunorm['SCI'].data[:,chip_edges[2][0]:] *= rightcorrection
+        # else:
+        #     # Raise both left and middle
+        #     leftcenterx = fitme_x[0: chip_edges[1][1] + 1]
+        #     #leftcorrection = pfm.pfcalc(right_middlechip_fit, leftcenterx) / pfm.pfcalc(rightchip_fit, leftcenterx)
+        #     leftcorrection = pfm.pfcalc(right_middlechip_fit, fitme_x[rightedge]) / pfm.pfcalc(rightchip_fit, fitme_x[rightedge])
+        #     hdunorm['SCI'].data[:,:chip_edges[1][1]+1] *= leftcorrection
+        #
+        rightcorrection = pfm.pfcalc(rightchip_fit, fitme_x[rightedge]) / pfm.pfcalc(right_middlechip_fit, fitme_x[rightedge])
+        hdunorm['SCI'].data[:,chip_edges[2][0]:] *= rightcorrection
+
+        # Replace the chip gaps with ones
+        hdunorm['SCI'].data[:, chip_edges[0][1]+1:chip_edges[1][0]] = 1
+        hdunorm['SCI'].data[:, chip_edges[1][1]+1:chip_edges[2][0]] = 1
+        # Save the final normalized flat
+        hdunorm.flush()
+        hdunorm.close()
 
 def wavesol(arcfiles, rawpath):
     for f in arcfiles:
         iraf.unlearn(iraf.gsreduce)
-        iraf.gsreduce('@' + f, outimages=f[:-4] + '.mef', rawpath=rawpath,
-                      fl_flat=True, bias="bias", flat=f[:-4].replace('arc', 'flat'),
-                      fl_fixpix=False, fl_over=dooverscan, fl_cut=False, fl_gmosaic=False,
-                      fl_gsappwave=False, fl_oversize=False)
+        iraf.gsreduce('@' + f, outimages=f[:-4], rawpath=rawpath,
+                      fl_flat=False, bias="bias",
+                      fl_fixpix=False, fl_over=dooverscan, fl_cut=False, fl_gmosaic=True,
+                      fl_gsappwave=True, fl_oversize=False)
 
-        # Read in the chip normalization
-        chip_norms = np.genfromtxt(f[:-8]+'.chipnorms.dat')
-        hdu = pyfits.open(f[:-4] + '.mef.fits', mode='update')
-
-        for i in range(1,5):
-            hdu[i].data *= chip_norms[0]
-        for i in range(9,13):
-            hdu[i].data *= chip_norms[1]
-
-        hdu.flush()
-        hdu.close()
-
-        iraf.unlearn(iraf.gmosaic)
-        iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4] +'.fits', fl_clean=False)
-
-        iraf.unlearn(iraf.gsappwave)
-        iraf.gsappwave(f[:-4] + '.fits')
+        # Divide out the flat file
+        flat_hdu = pyfits.open(f[:-4].replace('arc', 'flat')+'.fits')
+        arc_hdu = pyfits.open(f[:-4]+'.fits', mode='update')
+        arc_hdu['SCI'].data /= flat_hdu['SCI'].data
+        arc_hdu.flush()
+        arc_hdu.close()
+        flat_hdu.close()
 
         # determine wavelength calibration -- 1d and 2d
         iraf.unlearn(iraf.gswavelength)
@@ -866,29 +936,19 @@ def getredorblue(f):
 def scireduce(scifiles, rawpath):
     for f in scifiles:
         setupname = getsetupname(f)
-        # gsreduce subtracts bias, mosaics detectors, flat fields
+        # gsreduce subtracts bias and mosaics detectors
         iraf.unlearn(iraf.gsreduce)
-        iraf.gsreduce('@' + f, outimages=f[:-4]+'.mef', rawpath=rawpath, bias="bias",
-                      flat=setupname + '.flat', fl_over=dooverscan, fl_fixpix='no',
-                      fl_gmosaic=False, fl_cut=False, fl_gsappwave=False, fl_oversize=False, fl_flat=False)
+        iraf.gsreduce('@' + f, outimages=f[:-4], rawpath=rawpath, bias="bias",
+                      fl_over=dooverscan, fl_fixpix='no', fl_flat=False,
+                      fl_gmosaic=True, fl_cut=False, fl_gsappwave=False, fl_oversize=False)
 
-        # Read in the chip normalization
-        # chip_norms = np.genfromtxt(setupname+'.chipnorms.dat')
-        # hdu = pyfits.open(f[:-4] + '.mef.fits', mode='update')
-        #
-        # for i in range(1,5):
-        #     hdu[i].data *= chip_norms[0]
-        # for i in range(9,13):
-        #     hdu[i].data *= chip_norms[1]
-        #
-        # hdu.flush()
-        # hdu.close()
-
-        iraf.unlearn(iraf.gmosaic)
-        iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4] +'.fits', fl_clean=False)
-
-        iraf.unlearn(iraf.gsappwave)
-        iraf.gsappwave(f[:-4] + '.fits')
+        # Divide out the flat file
+        flat_hdu = pyfits.open(setupname + '.flat.fits')
+        sci_hdu = pyfits.open(f[:-4]+'.fits', mode='update')
+        sci_hdu['SCI'].data /= flat_hdu['SCI'].data
+        sci_hdu.flush()
+        sci_hdu.close()
+        flat_hdu.close()
 
         # Transform the data based on the arc  wavelength solution 
         iraf.unlearn(iraf.gstransform)
