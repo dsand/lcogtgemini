@@ -8,7 +8,7 @@ import os, shutil
 from glob import glob
 import pyfits
 import numpy as np
-import lacosmicx
+from scrappy import detect_cosmics
 from pyraf import iraf
 from scipy import interpolate, ndimage, signal, optimize
 import pf_model as pfm
@@ -981,7 +981,7 @@ def crreject(scifiles):
         pssl = (dsig * dsig - readnoise * readnoise)
 
         mask = d == 0.0
-        crmask, _cleanarr = lacosmicx.lacosmicx(d, inmask=mask, sigclip=4.0,
+        crmask, _cleanarr = detect_cosmics(d, inmask=mask, sigclip=4.0,
                                                 objlim=1.0, sigfrac=0.05, gain=1.0,
                                                 readnoise=readnoise, pssl=pssl)
         
