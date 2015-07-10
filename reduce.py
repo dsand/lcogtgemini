@@ -8,7 +8,7 @@ import os, shutil
 from glob import glob
 import pyfits
 import numpy as np
-from scrappy import detect_cosmics
+from astroscrappy import detect_cosmics
 from pyraf import iraf
 from scipy import interpolate, ndimage, signal, optimize
 import pf_model as pfm
@@ -33,6 +33,25 @@ is_GS = False
 def normalize_fitting_coordinate(x):
     xrange = x.max() - x.min()
     return (x - x.min()) / xrange
+
+
+class offset_model(models.Fittable1DModel):
+
+    cutoff = models.Parameter(default=0)
+    scale = models.Parameter(default=1)
+    c0 = models.Parameter(default=1)
+    c1 = models.Parameter(default=0)
+    c2 = models.Parameter(default=0)
+    c3 = models.Parameter(default=0)
+    c4 = models.Parameter(default=0)
+    c5 = models.Parameter(default=0)
+
+    @staticmethod
+    def evaluate(x, cutoff, scale, c0, c1, c2, c3, c4, c5):
+        y = c0 + c1 * x + c2 * x ** 2 + c3 * x ** 3 + c4 * x ** 4 + c5 * x ** 5
+        y[x >= cutoff] *= scale
+        return y
+
 
 
 # Iterative reweighting linear least squares
@@ -777,28 +796,37 @@ def makemasterflat(flatfiles, rawpath):
         # Divide the flat by the median over the spatial direction
         hdunorm = pyfits.open(f[:-4] + '.mef.fits')
 
-        for i in range(1, 13):
+        if is_GS:
+            num_extensions = 12
+        else:
+            num_extensions = 6
+
+
+        for i in range(1, num_extensions + 1):
             meddata = np.median(hdunorm[i].data, axis=0)
 
-            # Fit out the ramp up on the edge of the chip
-            x = np.arange(len(meddata), dtype=np.float)
-            x /= x.max()
-            if i in [1, 5, 9]:
-                fit = pfm.pffit(x[50:100], meddata[50:100], 0, 1,
-                                robust=True, M=sm.robust.norms.AndrewWave())
-                meddata[:50] = pfm.pfcalc(fit, x[:50])
-            elif i in [4, 8, 12]:
-                fit = pfm.pffit(x[-100:-50], meddata[-100:-50], 0, 1,
-                                robust=True, M=sm.robust.norms.AndrewWave())
-                meddata[-50:] = pfm.pfcalc(fit, x[-50:])
+            if is_GS:
+                # Fit out the ramp up on the edge of the chip
+                x = np.arange(len(meddata), dtype=np.float)
+                x /= x.max()
+                if i in [1, 5, 9]:
+                    fit = pfm.pffit(x[50:100], meddata[50:100], 0, 1,
+                                    robust=True, M=sm.robust.norms.AndrewWave())
+                    meddata[:50] = pfm.pfcalc(fit, x[:50])
+                elif i in [4, 8, 12]:
+                    fit = pfm.pffit(x[-100:-50], meddata[-100:-50], 0, 1,
+                                    robust=True, M=sm.robust.norms.AndrewWave())
+                    meddata[-50:] = pfm.pfcalc(fit, x[-50:])
 
             hdunorm[i].data /= meddata
 
 
         # Now we want to fit the jumps between chips
+
+        #TODO Try using IRLS with scipy curvefit to just fit over the gap
         hdu = pyfits.open(f[:-4] + '.mef.fits')
         # Divide out the pixel to pixel sensitivity
-        for i in range(1, 13):
+        for i in range(1, num_extensions + 1):
             hdu[i].data /= hdunorm[i].data
         hdu.writeto(f[:-4]+'.flt.fits', clobber=True)
         hdu.close()
@@ -818,24 +846,24 @@ def makemasterflat(flatfiles, rawpath):
         fitme_x /= fitme_x.max()
         fitme_y = data / np.median(data)
 
-        leftchip = slice(chip_edges[0][1] - 200, chip_edges[0][1])
+        leftchip = slice(chip_edges[0][1] - 50, chip_edges[0][1])
         leftchip_fit = pfm.pffit(fitme_x[leftchip], fitme_y[leftchip], 0 , 1,
                                  robust=True, M=sm.robust.norms.AndrewWave())
 
         # Normalize to the middle chip for now
-        left_middlechip = slice(chip_edges[1][0], chip_edges[1][0] + 150)
+        left_middlechip = slice(chip_edges[1][0], chip_edges[1][0] + 50)
 
         left_middlechip_fit = pfm.pffit(fitme_x[left_middlechip], fitme_y[left_middlechip], 0 , 1, robust=True,
                                    M=sm.robust.norms.AndrewWave())
 
 
         # Normalize to the middle chip for now
-        rightchip = slice(chip_edges[2][0], chip_edges[2][0] + 200)
+        rightchip = slice(chip_edges[2][0], chip_edges[2][0] + 50)
         rightchip_fit = pfm.pffit(fitme_x[rightchip], fitme_y[rightchip], 0 , 1, robust=True,
                                   M=sm.robust.norms.AndrewWave())
 
         # Then normalize the right chip to the middle chip
-        right_middlechip = slice(chip_edges[1][1] - 200, chip_edges[1][1])
+        right_middlechip = slice(chip_edges[1][1] - 50, chip_edges[1][1])
         right_middlechip_fit = pfm.pffit(fitme_x[right_middlechip], fitme_y[right_middlechip], 0 , 1,
                                    robust=True, M=sm.robust.norms.AndrewWave())
 
@@ -846,22 +874,23 @@ def makemasterflat(flatfiles, rawpath):
         # mosaic the normalized file
         iraf.unlearn(iraf.gmosaic)
         iraf.gmosaic(f[:-4] + '.norm.mef.fits', outimages=f[:-4] + '.fits', fl_clean=False)
-        #print(leftchip_fit, left_middlechip_fit)
-        #print(rightchip_fit, right_middlechip_fit)
-        #from matplotlib import pyplot
-        #pyplot.plot(fitme_x, fitme_y)
-        #pyplot.plot(fitme_x, pfm.pfcalc(leftchip_fit, fitme_x))
-        #pyplot.plot(fitme_x, pfm.pfcalc(left_middlechip_fit, fitme_x))
-        #pyplot.plot(fitme_x, pfm.pfcalc(rightchip_fit, fitme_x))
-        #pyplot.plot(fitme_x, pfm.pfcalc(right_middlechip_fit, fitme_x))
+        print(leftchip_fit, left_middlechip_fit)
+        print(rightchip_fit, right_middlechip_fit)
+        from matplotlib import pyplot
+        pyplot.plot(fitme_x, fitme_y)
+        pyplot.plot(fitme_x, pfm.pfcalc(leftchip_fit, fitme_x))
+        pyplot.plot(fitme_x, pfm.pfcalc(left_middlechip_fit, fitme_x))
+        pyplot.plot(fitme_x, pfm.pfcalc(rightchip_fit, fitme_x))
+        pyplot.plot(fitme_x, pfm.pfcalc(right_middlechip_fit, fitme_x))
+
         #pyplot.plot(fitme_x, pfm.pfcalc(rightchip_fit, fitme_x) / pfm.pfcalc(right_middlechip_fit, fitme_x))
-        #pyplot.show()
+        pyplot.show()
         hdunorm = pyfits.open(f[:-4]+'.fits', mode='update')
         # Renormalize the left and right chips from the fits above.
         # Get the value of the fits at the left edge of the middle chip
         leftedge = chip_edges[1][0]
         #if pfm.pfcalc(leftchip_fit, fitme_x[leftedge]) <  pfm.pfcalc(left_middlechip_fit, fitme_x[leftedge]):
-        #     # Raise the left chip
+             # Raise the left chip
         #     leftx = fitme_x[:chip_edges[0][1]]
         #     #leftcorrection = pfm.pfcalc(leftchip_fit, leftx) / pfm.pfcalc(left_middlechip_fit, leftx)
         #     leftcorrection = pfm.pfcalc(leftchip_fit, fitme_x[leftedge]) / pfm.pfcalc(left_middlechip_fit, fitme_x[leftedge])
