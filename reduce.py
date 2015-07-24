@@ -21,6 +21,7 @@ iraf.gemini()
 iraf.gmos()
 iraf.onedspec()
 
+bluecut = 3450
 
 iraf.gmos.logfile = "log.txt"
 iraf.gmos.mode = 'h'
@@ -58,6 +59,24 @@ class offset_right_model(astropy.modeling.Fittable1DModel):
 
     cutoff = astropy.modeling.Parameter(default=0)
     scale = astropy.modeling.Parameter(default=1)
+
+    c0 = astropy.modeling.Parameter(default=1)
+    c1 = astropy.modeling.Parameter(default=0)
+    c2 = astropy.modeling.Parameter(default=0)
+    c3 = astropy.modeling.Parameter(default=0)
+
+
+    @staticmethod
+    def evaluate(x, cutoff, scale, c0, c1, c2, c3):
+        y = c0 + c1 * x + c2 * x ** 2 + c3 * x ** 3
+        y[x >= cutoff] *= scale
+
+        return y
+
+class blackbody_model(astropy.modeling.Fittable1DModel):
+
+    normalization = astropy.modeling.Parameter(default=1)
+    temperature = astropy.modeling.Parameter(default=10000)
 
     c0 = astropy.modeling.Parameter(default=1)
     c1 = astropy.modeling.Parameter(default=0)
@@ -204,13 +223,12 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
     obs_hdu.close()
     obs_wave = fitshdr_to_wave(obs_hdr)
 
-    # Mask out everything below 3350 where there is no signal
-    obs_flux = obs_flux[obs_wave >= 3350.0]
-    obs_wave = obs_wave[obs_wave >= 3350.0]
+    # Mask out everything below 3450 where there is no signal
+    obs_flux = obs_flux[obs_wave >= bluecut]
+    obs_wave = obs_wave[obs_wave >= bluecut]
 
     # Figure out where the chip gaps are
     chip_edges = get_chipedges(obs_flux)
-
 
     try:
         chip_gaps = np.ones(obs_flux.size, dtype=np.bool)
@@ -235,7 +253,7 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
     # then convert it to fwave (ergs/s/cm2/A)
     std_wave, std_mag, _stdbnd = np.genfromtxt(stdfile).transpose()
     std_flux = magtoflux(std_wave, std_mag, stdzp)
- 
+
     # Get the typical bandpass of the standard star,
     std_bandpass = np.diff(std_wave).mean()
     # Smooth the observed spectrum to that bandpass
@@ -261,6 +279,7 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
     cal_hdr['OBJECT'] = 'Sensitivity function for all apertures'
     cal_hdr['CRVAL1'] = obs_wave.min()
     cal_hdr['CRPIX1'] = 1
+    cal_hdr['QESTATE'] = True
     tofits(outfile, cal_mag, hdr=cal_hdr, clobber=True)
 
 
@@ -325,13 +344,13 @@ def get_chipedges(data):
             morechips = True
             while morechips:
                 try:
-                    right_chipedge = np.min(w[w > left_chipedge]) - 10
+                    right_chipedge = np.min(w[w > (left_chipedge + 25)]) - 10
                 except:
                     right_chipedge = data.size - 10
                     morechips = False
                 chip_edges.append((left_chipedge, right_chipedge))
 
-                left_chipedge = np.max(w[w < right_chipedge + 100]) + 10
+                left_chipedge = np.max(w[w < (right_chipedge + 200)]) + 10
         except:
             chip_edges = []
         return chip_edges
@@ -414,8 +433,10 @@ def boxcar_smooth(spec_wave, spec_flux, smoothwidth):
     smoothed[(kw / 2):-(kw / 2)] = np.convolve(spec_flux, kernel, mode='valid')
     return smoothed
 
+# The last wavelength region was originally 9900. I bumped it down to 9800 to make
+# sure we have an anchor point at the end of the spectrum.
 telluricWaves = [(2000., 3190.), (3216., 3420.), (5500., 6050.), (6250., 6360.),
-                 (6450., 6530.), (6840., 7410.), (7550., 8410.), (8800., 9900.)]
+                 (6450., 6530.), (6840., 7410.), (7550., 8410.), (8800., 9800.)]
 def combine_spec_chi2(p, lam, specs, specerrs):
     # specs should be an array with shape (nspec, nlam)
     nspec = specs.shape[0]
@@ -491,7 +512,7 @@ def speccombine(fs, outfile):
         os.remove(outfile)
     iraf.unlearn(iraf.scombine)
     iraf.scombine(iraf_filelist, outfile, scale='@scales.dat',
-                  reject='avsigclip', lthreshold=1e-4, w1=3350)
+                  reject='avsigclip', lthreshold='INDEF', w1=bluecut)
 
 def fitshdr_to_wave(hdr):
     crval = float(hdr['CRVAL1'])
@@ -541,7 +562,7 @@ def mktelluric(filename):
     intpr = interpolate.splrep(waves[np.logical_not(chip_gaps)],
                                spec[np.logical_not(chip_gaps)],
                                w=1 / noise[np.logical_not(chip_gaps)], k=2,
-                               s=20 * np.logical_not(chip_gaps).sum())
+                               s=10 * np.logical_not(chip_gaps).sum())
     spec[chip_gaps] = interpolate.splev(waves[chip_gaps], intpr)
 
     not_telluric = telluric_mask(waves)
@@ -558,7 +579,7 @@ def mktelluric(filename):
     # Replace the telluric with the smoothed function
     smoothedspec = interpolate.splev(waves, intpr)
     
- 
+    import pdb; pdb.set_trace()
     # Extrapolate the ends linearly
     # Blue side
     w = np.logical_and(waves > 3420, waves < 3600)
@@ -577,7 +598,7 @@ def mktelluric(filename):
     correction = spec / smoothedspec
 
     airmass = float(hdr['AIRMASS'])
-    correction = correction ** (1.0 / airmass ** 0.55)
+    correction = correction ** (airmass ** -0.55)
     # Save the correction
     dout = np.ones((2, len(waves)))
     dout[0] = waves
@@ -665,6 +686,11 @@ def sort():
     
     if os.path.exists('raw/bias.fits'):
         shutil.copy('raw/bias.fits', 'work/')
+
+    fs = glob('raw/*.qe.fits')
+    if len(fs) > 0:
+        for f in fs:
+            shutil.copy(f, 'work/')
     
     # make a list of the raw files
     fs = glob('raw/*.fits')
@@ -802,21 +828,29 @@ def gettxtfiles(fs, objname):
     return flatfiles, arcfiles, scifiles
 
 
-def makemasterflat(flatfiles, rawpath):
+def makemasterflat(flatfiles, rawpath, plot=True):
     # normalize the flat fields
     for f in flatfiles:
-        iraf.unlearn(iraf.gsflat)
+
         # Use IRAF to get put the data in the right format and subtract the
         # bias
         # This will currently break if multiple flats are used for a single setting
         iraf.unlearn(iraf.gsreduce)
-        iraf.gsreduce('@' + f, outimages = f[:-4]+'.mos.fits',rawpath=rawpath,
-                      bias="bias", fl_over=dooverscan, fl_flat=False, fl_gmosaic=True,
+        iraf.gsreduce('@' + f, outimages = f[:-4]+'.mef.fits',rawpath=rawpath,
+                      bias="bias", fl_over=dooverscan, fl_flat=False, fl_gmosaic=False,
                       fl_fixpix=False, fl_gsappwave=False, fl_cut=False, fl_title=False,
                       fl_oversize=False)
 
         # Renormalize the chips to remove the discrete jump in the
         # sensitivity due to differences in the QE for different chips
+        iraf.unlearn(iraf.gqecorr)
+
+        iraf.gqecorr(f[:-4]+'.mef', outimages=f[:-4]+'.qe.fits', fl_keep=True, fl_correct=True,
+                     refimages=f[:-4].replace('flat', 'arc.arc.fits'),
+                     corrimages=f[:-9] +'.qe.fits', verbose=True)
+
+        iraf.unlearn(iraf.gmosaic)
+        iraf.gmosaic(f[:-4]+'.qe.fits', outimages=f[:-4]+'.mos.fits')
 
         flat_hdu = pyfits.open(f[:-4] + '.mos.fits')
 
@@ -828,108 +862,35 @@ def makemasterflat(flatfiles, rawpath):
 
         y = data / np.median(data)
 
-        left_x = x[chip_edges[0][1] - 200: chip_edges[0][1]]
-        left_x = np.append(left_x, x[chip_edges[1][0]:chip_edges[1][0] + 200])
+        fitme_x = x[chip_edges[0][0]:chip_edges[0][1]]
+        fitme_x = np.append(fitme_x, x[chip_edges[1][0]:chip_edges[1][1]])
+        fitme_x = np.append(fitme_x, x[chip_edges[2][0]:chip_edges[2][1]])
 
-        left_data = y[chip_edges[0][1] - 200: chip_edges[0][1]]
-        left_data = np.append(left_data, y[chip_edges[1][0]:chip_edges[1][0] + 200])
+        fitme_y = y[chip_edges[0][0]:chip_edges[0][1]]
+        fitme_y = np.append(fitme_y, y[chip_edges[1][0]:chip_edges[1][1]])
+        fitme_y = np.append(fitme_y, y[chip_edges[2][0]:chip_edges[2][1]])
 
-        left_errors = 0.01 * np.ones(len(left_data))
-
-        left_model = offset_left_model(cutoff=x[chip_edges[0][1] + 15]) #, scale_left=True)
-        left_model.cutoff.fixed = True
-
-        left_fit = irls(left_x, left_data, left_errors, left_model, maxiter=100)
-
-        right_x = x[chip_edges[1][1] - 200: chip_edges[1][1]]
-        right_x = np.append(right_x, x[chip_edges[2][0]:chip_edges[2][0] + 200])
-
-        right_data = y[chip_edges[1][1] - 200: chip_edges[1][1]]
-        right_data = np.append(right_data, y[chip_edges[2][0]:chip_edges[2][0] + 200])
-
-        right_errors = np.ones(len(right_data)) * 0.01
-
-        right_model = offset_right_model(cutoff=x[chip_edges[1][1]+15])
-        right_model.cutoff.fixed = True
-        right_fit = irls(right_x, right_data, right_errors, right_model, maxiter=100)
-
-        print(left_fit)
-        print(right_fit)
-
-        from matplotlib import pyplot
-        pyplot.plot(x, y)
-        pyplot.plot(x, left_fit(x))
-        pyplot.plot(x, right_fit(x))
-        pyplot.ylim(0.8 * y.min(), 1.2 * y.max())
-        pyplot.xlim(-0.05, 1.05)
-
-
-        pyplot.show()
-
-        iraf.gsreduce('@' + f, outimages = f[:-4]+'.mef.fits',rawpath=rawpath,
-                      bias="bias", fl_over=dooverscan, fl_flat=False, fl_gmosaic=False,
-                      fl_fixpix=False, fl_gsappwave=False, fl_cut=False, fl_title=False,
-                      fl_oversize=False)
-
-        hdu = pyfits.open(f[:-4] + '.mef.fits')
-        if is_GS:
-            numext = 12
-        else:
-            numext = 6
-        for i in range(1, numext + 1):
-            data = np.median(hdu[i].data, axis=0)
-            y = data /np.median(data)
-            x = np.arange(len(data), dtype=np.float)
-            x /= x.max()
-            fit = pfm.pffit(x, y, 2, 7, robust=True, M=sm.robust.norms.AndrewWave())
-            pyplot.plot(x,y)
+        fit = pfm.pffit(fitme_x, fitme_y, 15, 7, robust=True,
+                    M=sm.robust.norms.AndrewWave())
+        if plot:
+            from matplotlib import pyplot
+            pyplot.ion()
+            pyplot.clf()
+            pyplot.plot(x, y)
             pyplot.plot(x, pfm.pfcalc(fit, x))
-            pyplot.show()
-            hdu[i].data /= np.median(data)
-            hdu[i].data /= pfm.pfcalc(fit, x)
-
-        if is_GS:
-            # Remember that the original MEF files have red on the left and blue on the right.
-            for i in range(1, 5):
-                # Note this affects longer wavelenghths
-                hdu[i].data *= left_fit.scale
-            for i in range(9, 13):
-                # Note this affects shorter wavelengths
-                hdu[i].data *= right_fit.scale
-
-        hdu.writeto(f[:-4] + '.fits')
+            _junk = raw_input('Press enter to continue')
+        flat_hdu['SCI'].data /= pfm.pfcalc(fit, x) * np.median(data)
+        flat_hdu.writeto(f[:-4] + '.fits')
 
 
 def wavesol(arcfiles, rawpath):
     for f in arcfiles:
         iraf.unlearn(iraf.gsreduce)
-        iraf.gsreduce('@' + f, outimages=f[:-4]+'.mef', rawpath=rawpath,
+        iraf.gsreduce('@' + f, outimages=f[:-4], rawpath=rawpath,
                       fl_flat=False, bias="bias",
-                      fl_fixpix=False, fl_over=dooverscan, fl_cut=False, fl_gmosaic=False,
+                      fl_fixpix=False, fl_over=dooverscan, fl_cut=False, fl_gmosaic=True,
                       fl_gsappwave=False, fl_oversize=False)
 
-        # Divide out the flat file
-        flat_hdu = pyfits.open(f[:-4].replace('arc', 'flat')+'.fits')
-        arc_hdu = pyfits.open(f[:-4]+'.mef.fits', mode='update')
-        if is_GS:
-            numext = 12
-        else:
-            numext = 6
-
-        for i in range(1, numext):
-            arc_hdu[i].data /= flat_hdu[i].data
-
-        arc_hdu.flush()
-        arc_hdu.close()
-        flat_hdu.close()
-
-
-        iraf.unlearn(iraf.gmosaic)
-
-        iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4]+'.fits')
-
-        iraf.unlearn(iraf.gsappwave)
-        iraf.gsappwave(f[:-4]+'.fits')
 
         # determine wavelength calibration -- 1d and 2d
         iraf.unlearn(iraf.gswavelength)
@@ -937,12 +898,25 @@ def wavesol(arcfiles, rawpath):
                           high_reject=2.0, step=10, nsum=10, gsigma=3.0,
                           cradius=25.0, match=-12, order=7, fitcxord=7,
                           fitcyord=7)
-    
+
+        # Make an extra random copy so that gqecorr works. Stupid Gemini.
+        shutil.copy(f[:-4]+'.fits', f[:-4]+'.arc.fits')
         # transform the CuAr spectrum, for checking that the transformation is OK
         # output spectrum has prefix t
         iraf.unlearn(iraf.gstransform)
         iraf.gstransform(f[:-4], wavtran=f[:-4])
-    
+
+def make_qecorrection(arcfiles):
+    for f in arcfiles:
+        #read in the arcfile name
+        with open(f) as txtfile:
+            arcimage = txtfile.readline()
+            # Strip off the newline character
+            arcimage = 'g' + arcimage.split('\n')[0]
+        if not os.path.exists(f[:-8] +'.qe.fits'):
+            iraf.gqecorr(arcimage, refimages=f[:-4]+'.arc.fits', fl_correct=False, fl_keep=True,
+                         corrimages=f[:-8] +'.qe.fits', verbose=True)
+
 def getsetupname(f):
     # Get the setup base name by removing the exposure number
     return f.split('.')[0] + '.' + f.split('.')[1][1:]
@@ -959,25 +933,23 @@ def scireduce(scifiles, rawpath):
                       fl_over=dooverscan, fl_fixpix='no', fl_flat=False,
                       fl_gmosaic=False, fl_cut=False, fl_gsappwave=False, fl_oversize=False)
 
-        # Divide out the flat file
-        flat_hdu = pyfits.open(setupname + '.flat.fits')
-        sci_hdu = pyfits.open(f[:-4]+'.mef.fits', mode='update')
-
-        if is_GS:
-            numext = 12
-        else:
-            numext = 6
-
-        for i in range(1, numext):
-            sci_hdu[i].data /= flat_hdu[i].data
-
-        sci_hdu.flush()
-        sci_hdu.close()
-        flat_hdu.close()
+        # Renormalize the chips to remove the discrete jump in the
+        # sensitivity due to differences in the QE for different chips
+        iraf.unlearn(iraf.gqecorr)
+        iraf.gqecorr(f[:-4]+'.mef', outimages=f[:-4]+'.qe.fits', fl_keep=True, fl_correct=True,
+                     refimages=setupname + '.arc.arc.fits',
+                     corrimages=setupname +'.qe.fits', verbose=True)
 
         iraf.unlearn(iraf.gmosaic)
-        iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4] +'.fits')
-        # Transform the data based on the arc  wavelength solution 
+        iraf.gmosaic(f[:-4]+'.qe.fits', outimages=f[:-4] +'.fits')
+
+        # Flat field the image
+        hdu = pyfits.open(f[:-4]+'.fits', mode='update')
+        hdu['SCI'].data /= pyfits.getdata(setupname+'.flat.fits', extname='SCI')
+        hdu.flush()
+        hdu.close()
+
+        # Transform the data based on the arc  wavelength solution
         iraf.unlearn(iraf.gstransform)
         iraf.gstransform(f[:-4], wavtran=setupname + '.arc')
 
@@ -1031,10 +1003,73 @@ def extract(scifiles):
                        background='fit', weights='variance',
                        lsigma=3.0, usigma=3.0, mode='h')
 
+        # Trim off below the blue side cut
+        hdu = pyfits.open('et' + f[:-4] +'.fits', mode='update')
+        lam = fitshdr_to_wave(hdu['SCI'].header)
+        w = lam > bluecut
+        trimmed_data =np.zeros((1, w.sum()))
+        trimmed_data[0] = hdu['SCI'].data[0, w]
+        hdu['SCI'].data = trimmed_data
+        hdu['SCI'].header['NAXIS1'] = w.sum()
+        hdu['SCI'].header['CRPIX1'] = 1
+        hdu['SCI'].header['CRVAL1'] = lam[w][0]
+        hdu.flush()
+
+        hdu.close()
+
+
+def rescale_chips(scifiles):
+    for f in scifiles:
+        hdu = pyfits.open('et'+ f[:-4]+'.fits', mode='update')
+        chip_edges = get_chipedges(hdu['SCI'].data)
+        lam = fitshdr_to_wave(hdu['SCI'].header)
+        x = (lam - lam.min())/ (lam.max() - lam.min())
+        y = hdu['SCI'].data[0] / np.median(hdu['SCI'].data[0])
+
+        # Fit the left chip
+        left_x = x[chip_edges[0][1] - 200: chip_edges[0][1]]
+        left_x = np.append(left_x, x[chip_edges[1][0]: chip_edges[1][0] + 200])
+
+        left_data = y[chip_edges[0][1] - 200: chip_edges[0][1]]
+        left_data = np.append(left_data , y[chip_edges[1][0]: chip_edges[1][0] + 200])
+
+        left_errors = float(hdu['SCI'].header['RDNOISE']) ** 2.0
+        left_errors += left_data * np.median(hdu['SCI'].data[0])
+        left_errors **= 0.5
+        left_errors /= np.median(hdu['SCI'].data[0])
+
+        left_model = offset_left_model(cutoff=x[chip_edges[0][1] + 25])
+        left_model.cutoff.fixed = True
+
+        left_fit = irls(left_x, left_data, left_errors, left_model, maxiter=100)
+
+        # Fit the right chip
+        right_x = x[chip_edges[1][1] - 300: chip_edges[1][1]]
+        right_x = np.append(right_x, x[chip_edges[2][0]: chip_edges[2][0] + 300])
+
+        right_data = y[chip_edges[1][1] - 300: chip_edges[1][1]]
+        right_data = np.append(right_data , y[chip_edges[2][0]: chip_edges[2][0] + 300])
+
+        right_errors = float(hdu['SCI'].header['RDNOISE']) ** 2.0
+        right_errors += right_data * np.median(hdu['SCI'].data[0])
+        right_errors **= 0.5
+        right_errors /= np.median(hdu['SCI'].data[0])
+
+        right_model = offset_right_model(cutoff=x[chip_edges[1][1] + 25])
+        right_model.cutoff.fixed = True
+
+        right_fit = irls(right_x, right_data, right_errors, right_model, maxiter=100)
+
+        hdu['SCI'].data[0, : chip_edges[0][1] + 35] /= left_fit.scale
+        hdu['SCI'].data[0, chip_edges[2][0] - 35 :] /= right_fit.scale
+        hdu.flush()
+        hdu.close()
+
 def makesensfunc(scifiles, objname, base_stddir, extfile):   
     for f in scifiles:
         redorblue = getredorblue(f)
         # If this is a standard star, run standard
+        # Standards will have an observation class of either progCal or partnerCal
         # Standards will have an observation class of either progCal or partnerCal
         obsclass = pyfits.getval(f[:-4] + '.fits', 'OBSCLASS')
         if obsclass == 'progCal' or obsclass == 'partnerCal':
@@ -1138,14 +1173,17 @@ if __name__ == "__main__":
                 
     # remember not to put ".fits" on the end of filenames!
     flatfiles, arcfiles, scifiles = gettxtfiles(fs, objname)
-    
-    # Make the master flat field image
-    makemasterflat(flatfiles, rawpath)
-    
-    # Get the wavelength solution
+
+    # Get the wavelength solution which is apparently needed for everything else
     wavesol(arcfiles, rawpath)
 
-    # Flat field and rectify the scienc images
+    # Make the QE correction
+    make_qecorrection(arcfiles)
+
+    # Make the master flat field image
+    makemasterflat(flatfiles, rawpath)
+
+    # Flat field and rectify the science images
     scireduce(scifiles, rawpath)
 
     # Run sky subtraction
@@ -1159,6 +1197,9 @@ if __name__ == "__main__":
 
     # Extract the 1D spectrum
     extract(scifiles)
+
+    # Rescale the chips based on the science image
+    rescale_chips(scifiles)
 
     # If standard star, make the sensitivity function
     makesensfunc(scifiles, objname, base_stddir, extfile)
