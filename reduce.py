@@ -577,8 +577,7 @@ def mktelluric(filename):
 
     # Replace the telluric with the smoothed function
     smoothedspec = interpolate.splev(waves, intpr)
-    
-    import pdb; pdb.set_trace()
+
     # Extrapolate the ends linearly
     # Blue side
     w = np.logical_and(waves > 3420, waves < 3600)
@@ -1209,7 +1208,7 @@ if __name__ == "__main__":
     extract(scifiles)
 
     # Rescale the chips based on the science image
-    rescale_chips(scifiles)
+    #rescale_chips(scifiles)
 
     # If standard star, make the sensitivity function
     makesensfunc(scifiles, objname, base_stddir, extfile)
