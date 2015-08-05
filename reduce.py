@@ -75,21 +75,15 @@ class offset_right_model(astropy.modeling.Fittable1DModel):
 
 class blackbody_model(astropy.modeling.Fittable1DModel):
 
-    normalization = astropy.modeling.Parameter(default=1)
     temperature = astropy.modeling.Parameter(default=10000)
-
-    c0 = astropy.modeling.Parameter(default=1)
-    c1 = astropy.modeling.Parameter(default=0)
-    c2 = astropy.modeling.Parameter(default=0)
-    c3 = astropy.modeling.Parameter(default=0)
-
+    normalization = astropy.modeling.Parameter(default=1)
 
     @staticmethod
-    def evaluate(x, cutoff, scale, c0, c1, c2, c3):
-        y = c0 + c1 * x + c2 * x ** 2 + c3 * x ** 3
-        y[x >= cutoff] *= scale
-
-        return y
+    def evaluate(x, temperature=10000., normalization=1.0):
+        # Note x needs to be in microns and temperature needs to be in K
+        flam = normalization * x ** -5
+        flam /= np.exp(14387.7696 / x / temperature) - 1
+        return flam
 
 
 # Iterative reweighting linear least squares
@@ -279,7 +273,11 @@ def specsens(specfile, outfile, stdfile, extfile, airmass=None, exptime=None,
     cal_hdr['OBJECT'] = 'Sensitivity function for all apertures'
     cal_hdr['CRVAL1'] = obs_wave.min()
     cal_hdr['CRPIX1'] = 1
-    cal_hdr['QESTATE'] = True
+    if is_GS:
+        cal_hdr['QESTATE'] = True
+    else:
+        cal_hdr['QESTATE'] = False
+
     tofits(outfile, cal_mag, hdr=cal_hdr, clobber=True)
 
 
@@ -540,6 +538,7 @@ def telluric_mask(waves):
     return not_telluric
 
 def mktelluric(filename):
+    #TODO Try fitting a black body instead of interpolating.
     # if it is a standard star combined file
     # read in the spectrum and calculate the wavelengths of the pixels
     hdu = pyfits.open(filename)
@@ -841,16 +840,20 @@ def makemasterflat(flatfiles, rawpath, plot=True):
                       fl_fixpix=False, fl_gsappwave=False, fl_cut=False, fl_title=False,
                       fl_oversize=False)
 
-        # Renormalize the chips to remove the discrete jump in the
-        # sensitivity due to differences in the QE for different chips
-        iraf.unlearn(iraf.gqecorr)
+        if is_GS:
+            # Renormalize the chips to remove the discrete jump in the
+            # sensitivity due to differences in the QE for different chips
+            iraf.unlearn(iraf.gqecorr)
 
-        iraf.gqecorr(f[:-4]+'.mef', outimages=f[:-4]+'.qe.fits', fl_keep=True, fl_correct=True,
-                     refimages=f[:-4].replace('flat', 'arc.arc.fits'),
-                     corrimages=f[:-9] +'.qe.fits', verbose=True)
+            iraf.gqecorr(f[:-4]+'.mef', outimages=f[:-4]+'.qe.fits', fl_keep=True, fl_correct=True,
+                         refimages=f[:-4].replace('flat', 'arc.arc.fits'),
+                         corrimages=f[:-9] +'.qe.fits', verbose=True)
 
-        iraf.unlearn(iraf.gmosaic)
-        iraf.gmosaic(f[:-4]+'.qe.fits', outimages=f[:-4]+'.mos.fits')
+            iraf.unlearn(iraf.gmosaic)
+            iraf.gmosaic(f[:-4]+'.qe.fits', outimages=f[:-4]+'.mos.fits')
+        else:
+            iraf.unlearn(iraf.gmosaic)
+            iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4]+'.mos.fits')
 
         flat_hdu = pyfits.open(f[:-4] + '.mos.fits')
 
@@ -899,8 +902,9 @@ def wavesol(arcfiles, rawpath):
                           cradius=25.0, match=-12, order=7, fitcxord=7,
                           fitcyord=7)
 
-        # Make an extra random copy so that gqecorr works. Stupid Gemini.
-        shutil.copy(f[:-4]+'.fits', f[:-4]+'.arc.fits')
+        if is_GS:
+            # Make an extra random copy so that gqecorr works. Stupid Gemini.
+            shutil.copy(f[:-4]+'.fits', f[:-4]+'.arc.fits')
         # transform the CuAr spectrum, for checking that the transformation is OK
         # output spectrum has prefix t
         iraf.unlearn(iraf.gstransform)
@@ -908,14 +912,15 @@ def wavesol(arcfiles, rawpath):
 
 def make_qecorrection(arcfiles):
     for f in arcfiles:
-        #read in the arcfile name
-        with open(f) as txtfile:
-            arcimage = txtfile.readline()
-            # Strip off the newline character
-            arcimage = 'g' + arcimage.split('\n')[0]
-        if not os.path.exists(f[:-8] +'.qe.fits'):
-            iraf.gqecorr(arcimage, refimages=f[:-4]+'.arc.fits', fl_correct=False, fl_keep=True,
-                         corrimages=f[:-8] +'.qe.fits', verbose=True)
+        if is_GS:
+            #read in the arcfile name
+            with open(f) as txtfile:
+                arcimage = txtfile.readline()
+                # Strip off the newline character
+                arcimage = 'g' + arcimage.split('\n')[0]
+            if not os.path.exists(f[:-8] +'.qe.fits'):
+                iraf.gqecorr(arcimage, refimages=f[:-4]+'.arc.fits', fl_correct=False, fl_keep=True,
+                             corrimages=f[:-8] +'.qe.fits', verbose=True)
 
 def getsetupname(f):
     # Get the setup base name by removing the exposure number
@@ -933,15 +938,19 @@ def scireduce(scifiles, rawpath):
                       fl_over=dooverscan, fl_fixpix='no', fl_flat=False,
                       fl_gmosaic=False, fl_cut=False, fl_gsappwave=False, fl_oversize=False)
 
-        # Renormalize the chips to remove the discrete jump in the
-        # sensitivity due to differences in the QE for different chips
-        iraf.unlearn(iraf.gqecorr)
-        iraf.gqecorr(f[:-4]+'.mef', outimages=f[:-4]+'.qe.fits', fl_keep=True, fl_correct=True,
-                     refimages=setupname + '.arc.arc.fits',
-                     corrimages=setupname +'.qe.fits', verbose=True)
+        if is_GS:
+            # Renormalize the chips to remove the discrete jump in the
+            # sensitivity due to differences in the QE for different chips
+            iraf.unlearn(iraf.gqecorr)
+            iraf.gqecorr(f[:-4]+'.mef', outimages=f[:-4]+'.qe.fits', fl_keep=True, fl_correct=True,
+                         refimages=setupname + '.arc.arc.fits',
+                         corrimages=setupname +'.qe.fits', verbose=True)
 
-        iraf.unlearn(iraf.gmosaic)
-        iraf.gmosaic(f[:-4]+'.qe.fits', outimages=f[:-4] +'.fits')
+            iraf.unlearn(iraf.gmosaic)
+            iraf.gmosaic(f[:-4]+'.qe.fits', outimages=f[:-4] +'.fits')
+        else:
+            iraf.unlearn(iraf.gmosaic)
+            iraf.gmosaic(f[:-4]+'.mef.fits', outimages=f[:-4] +'.fits')
 
         # Flat field the image
         hdu = pyfits.open(f[:-4]+'.fits', mode='update')
@@ -1065,7 +1074,8 @@ def rescale_chips(scifiles):
         hdu.flush()
         hdu.close()
 
-def makesensfunc(scifiles, objname, base_stddir, extfile):   
+def makesensfunc(scifiles, objname, base_stddir, extfile):
+    #TODO use individual standard star observations in each setting, not just red and blue
     for f in scifiles:
         redorblue = getredorblue(f)
         # If this is a standard star, run standard
